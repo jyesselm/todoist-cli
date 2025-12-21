@@ -1,0 +1,30 @@
+# Todoist CLI Configuration
+# Copy this file to config.yml and customize
+
+# API Token (optional if using TODOIST_API_TOKEN environment variable)
+# Get your token from: https://todoist.com/app/settings/integrations/developer
+# api-token: your_token_here
+
+# Shortcuts for fast input
+shortcuts:
+  # Label shortcuts: shortcut -> full label name
+  labels:
+    w: work
+    h: home
+    u: urgent
+    # Add your own...
+    # c: context/computer
+    # e: context/email
+
+  # Project shortcuts: shortcut -> full project name
+  projects:
+    i: Inbox
+    # w: Work
+    # p: Personal
+
+  # Priority shortcuts (optional)
+  priorities:
+    u: p4   # 'u' expands to p4 (urgent)
+
+# Note: The 'cached' section is auto-populated by 't sync'
+# Do not edit manually
