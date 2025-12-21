@@ -4,6 +4,11 @@ import re
 from dataclasses import dataclass, field
 
 
+def _strip_emoji(text: str) -> str:
+    """Strip leading emoji and whitespace from text."""
+    return re.sub(r'^[\U0001F300-\U0001F9FF\U00002600-\U000026FF\U00002700-\U000027BF\s]+', '', text)
+
+
 @dataclass
 class ParsedTask:
     """Result of parsing task content."""
@@ -172,16 +177,27 @@ class TaskParser:
             params["labels"] = parsed.labels
 
         if parsed.priority:
-            params["priority"] = parsed.priority
+            # Convert user-facing priority to API value (invert: p1->4, p2->3, p3->2, p4->1)
+            params["priority"] = 5 - parsed.priority
 
         if parsed.due_string:
             params["due_string"] = parsed.due_string
 
         if parsed.project and project_lookup:
-            # Look up project ID by name (case-insensitive)
+            # Look up project ID by name (case-insensitive, supports emoji and nested projects)
+            search = _strip_emoji(parsed.project.lower())
+            # First try exact match (with emoji stripped)
             for name, project_id in project_lookup.items():
-                if name.lower() == parsed.project.lower():
+                if _strip_emoji(name).lower() == search:
                     params["project_id"] = project_id
                     break
+            else:
+                # Try partial match for nested projects (e.g., "work" -> "Work/Projects")
+                prefix = search + "/"
+                for name, project_id in project_lookup.items():
+                    stripped_name = _strip_emoji(name).lower()
+                    if stripped_name.startswith(prefix):
+                        params["project_id"] = project_id
+                        break
 
         return params

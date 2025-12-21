@@ -16,12 +16,12 @@ from todoist_cli.session import SessionCache
 class TaskFormatter:
     """Format tasks for Rich console output."""
 
-    # Priority colors (Todoist uses 4=urgent, 1=normal)
+    # Priority colors (API uses inverted values: api_priority=4 means P1/urgent)
     PRIORITY_STYLES = {
-        4: Style(color="red", bold=True),      # P1 - Urgent
-        3: Style(color="orange1", bold=True),  # P2 - High
-        2: Style(color="yellow"),              # P3 - Medium
-        1: Style(color="white"),               # P4 - Normal
+        4: Style(color="red", bold=True),      # API 4 = P1 - Urgent
+        3: Style(color="orange1", bold=True),  # API 3 = P2 - High
+        2: Style(color="yellow"),              # API 2 = P3 - Medium
+        1: Style(color="white"),               # API 1 = P4 - Normal
     }
 
     PRIORITY_MARKERS = {

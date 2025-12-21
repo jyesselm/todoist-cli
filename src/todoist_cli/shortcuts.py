@@ -5,6 +5,11 @@ import re
 from todoist_cli.models import ShortcutConfig, Project, Label
 
 
+def _strip_emoji(text: str) -> str:
+    """Strip leading emoji and whitespace from text."""
+    return re.sub(r'^[\U0001F300-\U0001F9FF\U00002600-\U000026FF\U00002700-\U000027BF\s]+', '', text)
+
+
 class ShortcutExpander:
     """Expands user-defined shortcuts in task content.
 
@@ -22,6 +27,10 @@ class ShortcutExpander:
     ):
         self._shortcuts = shortcuts
         self._projects = {p.name.lower(): p.name for p in (projects or [])}
+        # Also store stripped versions (no emoji) for matching
+        self._projects_stripped = {
+            _strip_emoji(p.name).lower(): p.name for p in (projects or [])
+        }
         self._labels = {l.name.lower(): l.name for l in (labels or [])}
 
         # Build reverse lookup: shortcut -> full name
@@ -98,16 +107,29 @@ class ShortcutExpander:
         """Expand a project shortcut.
 
         Returns expanded project name, or None if no match.
+        Supports nested projects and emoji names: 'work' matches '🔵 Work'.
         """
         lower = shortcut.lower()
+        stripped = _strip_emoji(lower)
 
         # Check shortcuts first
         if lower in self._project_shortcuts:
             return self._project_shortcuts[lower]
 
-        # Check if it's already a valid project name
+        # Check if it's already a valid project name (exact match)
         if lower in self._projects:
             return self._projects[lower]
+
+        # Check stripped version (without emoji)
+        if stripped in self._projects_stripped:
+            return self._projects_stripped[stripped]
+
+        # Check for partial match with nested projects (e.g., "work" -> "Work/Projects")
+        # Look for projects that start with the input followed by "/"
+        prefix = stripped + "/"
+        for project_stripped, project_name in self._projects_stripped.items():
+            if project_stripped.startswith(prefix) or project_stripped == stripped:
+                return project_name
 
         # Return original if no match
         return shortcut

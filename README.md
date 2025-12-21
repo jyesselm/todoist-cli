@@ -153,9 +153,9 @@ t add "Call mom" -p Personal
 t add "Debug issue @coding @urgent"
 t add "Read paper @c"      # shortcut for @context/computer
 
-# With priority (p1=normal, p4=urgent)
-t add "Critical fix p4"
-t add "Nice to have p1"
+# With priority (p1=urgent/red, p4=low/default)
+t add "Critical fix p1"
+t add "Nice to have p4"
 
 # With due date (natural language)
 t add "Submit report tomorrow"
