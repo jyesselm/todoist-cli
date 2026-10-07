@@ -1,5 +1,6 @@
 """Configuration management for Todoist CLI."""
 
+import json
 import os
 from pathlib import Path
 from datetime import datetime
@@ -10,6 +11,15 @@ from todoist_cli.models import Config, ShortcutConfig, CachedData, Project, Labe
 
 # Environment variable for API token (preferred for security)
 ENV_API_TOKEN = "TODOIST_API_TOKEN"
+# Shared token file (key "token"), also used by other Todoist tooling on this machine
+SHARED_TOKEN_FILE = Path.home() / ".config" / "todoist" / "config.json"
+
+
+def _shared_token() -> str | None:
+    """Read the token from the shared ~/.config/todoist/config.json, if present."""
+    if not SHARED_TOKEN_FILE.exists():
+        return None
+    return json.loads(SHARED_TOKEN_FILE.read_text()).get("token")
 
 
 class ConfigManager:
@@ -54,7 +64,7 @@ class ConfigManager:
             return self._config
 
         # Check if we have env var token (config file optional in this case)
-        env_token = os.environ.get(ENV_API_TOKEN)
+        env_token = os.environ.get(ENV_API_TOKEN) or _shared_token()
 
         if not self._config_path.exists():
             if env_token:
@@ -111,8 +121,7 @@ class ConfigManager:
         self._config_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Check if token is from environment (don't save it to file)
-        env_token = os.environ.get(ENV_API_TOKEN)
-        save_token = env_token is None  # Only save if NOT using env var
+        save_token = os.environ.get(ENV_API_TOKEN) is None and _shared_token() is None
 
         # Convert to dict with proper key names
         data: dict = {}
@@ -151,7 +160,7 @@ class ConfigManager:
         Environment variable TODOIST_API_TOKEN takes precedence.
         """
         # Check environment variable first (preferred for security)
-        env_token = os.environ.get(ENV_API_TOKEN)
+        env_token = os.environ.get(ENV_API_TOKEN) or _shared_token()
         if env_token:
             return env_token
 

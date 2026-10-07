@@ -1,4 +1,4 @@
-"""Todoist REST API v2 client."""
+"""Todoist API v1 client (REST v2 was retired with a 410 in 2026)."""
 
 import httpx
 
@@ -14,9 +14,10 @@ class TodoistError(Exception):
 
 
 class TodoistClient:
-    """Client for Todoist REST API v2."""
+    """Client for Todoist API v1."""
 
-    BASE_URL = "https://api.todoist.com/rest/v2"
+    BASE_URL = "https://api.todoist.com/api/v1"
+    PAGE_SIZE = 200
 
     def __init__(self, api_token: str):
         """Initialize client with API token."""
@@ -51,8 +52,20 @@ class TodoistClient:
         except httpx.RequestError as e:
             raise TodoistError(f"Request failed: {e}")
 
+    def _get_all(self, endpoint: str, params: dict | None = None) -> list[dict]:
+        """GET a v1 list endpoint, following `next_cursor` until exhausted."""
+        params = dict(params or {}, limit=self.PAGE_SIZE)
+        items: list[dict] = []
+        while True:
+            page = self._request("GET", endpoint, params=params) or {}
+            items.extend(page.get("results", []))
+            cursor = page.get("next_cursor")
+            if not cursor:
+                return items
+            params["cursor"] = cursor
+
     def _parse_task(self, data: dict) -> Task:
-        """Parse task data from API response."""
+        """Parse task data from API response (v1 field names)."""
         due = None
         if data.get("due"):
             due = DueDate(**data["due"])
@@ -67,12 +80,23 @@ class TodoistClient:
             section_id=data.get("section_id"),
             parent_id=data.get("parent_id"),
             labels=data.get("labels", []),
-            order=data.get("order", 0),
-            comment_count=data.get("comment_count", 0),
-            is_completed=data.get("is_completed", False),
-            created_at=data.get("created_at", ""),
-            creator_id=data.get("creator_id", ""),
-            url=data.get("url", ""),
+            order=data.get("child_order", 0),
+            comment_count=data.get("note_count", 0),
+            is_completed=data.get("checked", False),
+            created_at=data.get("added_at", ""),
+            creator_id=data.get("added_by_uid", ""),
+            url=f"https://app.todoist.com/app/task/{data['id']}",
+        )
+
+    def _parse_project(self, data: dict) -> Project:
+        """Parse project data from API response (v1 field names)."""
+        return Project(
+            id=data["id"],
+            name=data["name"],
+            color=data.get("color", "grey"),
+            parent_id=data.get("parent_id"),
+            order=data.get("child_order", 0),
+            is_favorite=data.get("is_favorite", False),
         )
 
     # ── Tasks ──────────────────────────────────────────────────────────────
@@ -92,18 +116,18 @@ class TodoistClient:
             section_id: Filter by section
             label: Filter by label name
         """
-        params = {}
         if filter:
-            params["filter"] = filter
-        if project_id:
-            params["project_id"] = project_id
-        if section_id:
-            params["section_id"] = section_id
-        if label:
-            params["label"] = label
-
-        data = self._request("GET", "/tasks", params=params or None)
-        return [self._parse_task(t) for t in (data or [])]
+            data = self._get_all("/tasks/filter", {"query": filter})
+        else:
+            params = {}
+            if project_id:
+                params["project_id"] = project_id
+            if section_id:
+                params["section_id"] = section_id
+            if label:
+                params["label"] = label
+            data = self._get_all("/tasks", params)
+        return [self._parse_task(t) for t in data]
 
     def get_task(self, task_id: str) -> Task:
         """Get a single task by ID."""
@@ -209,36 +233,17 @@ class TodoistClient:
 
     def get_projects(self) -> list[Project]:
         """Get all projects."""
-        data = self._request("GET", "/projects")
-        return [
-            Project(
-                id=p["id"],
-                name=p["name"],
-                color=p.get("color", "grey"),
-                parent_id=p.get("parent_id"),
-                order=p.get("order", 0),
-                is_favorite=p.get("is_favorite", False),
-            )
-            for p in (data or [])
-        ]
+        return [self._parse_project(p) for p in self._get_all("/projects")]
 
     def get_project(self, project_id: str) -> Project:
         """Get a single project by ID."""
-        data = self._request("GET", f"/projects/{project_id}")
-        return Project(
-            id=data["id"],
-            name=data["name"],
-            color=data.get("color", "grey"),
-            parent_id=data.get("parent_id"),
-            order=data.get("order", 0),
-            is_favorite=data.get("is_favorite", False),
-        )
+        return self._parse_project(self._request("GET", f"/projects/{project_id}"))
 
     # ── Labels ─────────────────────────────────────────────────────────────
 
     def get_labels(self) -> list[Label]:
         """Get all labels."""
-        data = self._request("GET", "/labels")
+        data = self._get_all("/labels")
         return [
             Label(
                 id=l["id"],
@@ -247,14 +252,14 @@ class TodoistClient:
                 order=l.get("order", 0),
                 is_favorite=l.get("is_favorite", False),
             )
-            for l in (data or [])
+            for l in data
         ]
 
     # ── Comments ───────────────────────────────────────────────────────────
 
     def get_comments(self, task_id: str) -> list[Comment]:
         """Get comments for a task."""
-        data = self._request("GET", "/comments", params={"task_id": task_id})
+        data = self._get_all("/comments", {"task_id": task_id})
         return [
             Comment(
                 id=c["id"],
@@ -263,7 +268,7 @@ class TodoistClient:
                 content=c["content"],
                 posted_at=c["posted_at"],
             )
-            for c in (data or [])
+            for c in data
         ]
 
     def create_comment(self, task_id: str, content: str) -> Comment:

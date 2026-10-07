@@ -1103,8 +1103,8 @@ def view_task(
             formatter.format_error(f"Task #{num} not found. Run 't list' first.")
             raise typer.Exit(1)
 
-        # Optionally fetch comments
-        comments = client.get_comments(task_id) if task.comment_count > 0 else None
+        # Always fetch: v1 note_count lags behind comments added via the API
+        comments = client.get_comments(task_id)
 
         panel = formatter.format_single_task(task, num, comments)
         console.print(panel)
