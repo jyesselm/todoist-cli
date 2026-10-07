@@ -10,6 +10,10 @@ A fast, shortcut-driven command-line interface for Todoist. Designed for power u
 - **Bulk operations**: Complete, move, or tag multiple tasks at once
 - **Natural language dates**: "tomorrow", "next monday", "every day"
 - **Subtask support**: Full hierarchy display and creation
+- **Today board**: `t` shows `today | overdue | p3` grouped by priority (P1 = the one focus task)
+- **Sections and deadlines**: list/add into a project section, set hard deadlines
+
+Targets the Todoist **API v1** (`https://api.todoist.com/api/v1`); the old REST v2 is retired.
 
 ## Installation
 
@@ -31,7 +35,11 @@ t --help
 
 Get your API token from: https://todoist.com/app/settings/integrations/developer
 
-**Option 1: Environment Variable (Recommended)**
+Token lookup order: `TODOIST_API_TOKEN` env var, then `~/.config/todoist/config.json`
+(key `"token"`, shared with other Todoist tooling), then `api-token` in `config.yml`.
+A token from the env var or the shared file is never written back to `config.yml`.
+
+**Option 1: Environment Variable**
 
 ```bash
 export TODOIST_API_TOKEN="your_api_token_here"
@@ -47,7 +55,13 @@ Create `config.yml` in the project directory:
 api-token: your_api_token_here
 ```
 
-> **Note**: Environment variable takes precedence over config file.
+**Option 3: Shared token file**
+
+```json
+{"token": "your_api_token_here"}
+```
+
+saved as `~/.config/todoist/config.json`.
 
 ### Shortcuts (Optional)
 
@@ -56,17 +70,20 @@ Create or edit `config.yml` to define shortcuts:
 ```yaml
 shortcuts:
   labels:
-    w: work
-    h: home
-    u: urgent
-    c: context/computer
-    e: context/email
+    q: quick       # <= 10 minutes
+    w: waiting
   projects:
     i: Inbox
-    w: Work
-    p: Personal
+    r: 🔬 Research
+    t: 🎓 Teaching
+    c: 🤝 Collabs
+    s: 🏛 Service
+    l: 🧰 Lab
+    p: 🏠 Personal
+    f: 💡 Someday
+    u: 👥 Students
   priorities:
-    u: p4   # 'u' expands to p4 (urgent)
+    u: p1          # 'u' expands to p1 (the focus task)
 ```
 
 Copy from `config.example.yml` to get started:
@@ -86,31 +103,46 @@ t sync
 ## Quick Start
 
 ```bash
-# View today's tasks and overdue items
+# Today board: today | overdue | p3, grouped by priority
 t
 
+# Make task #2 the one P1 focus task for today
+t focus 2
+
+# Mark tasks #3 and #4 as quick wins (@quick, due today)
+t quick 3,4
+
 # Add a task
-t add "Review pull request"
+t add "Fix bug @q p3 tomorrow"
 
-# Add with labels, priority, and due date
-t add "Fix bug @w p3 tomorrow"
-
-# Complete task #1
-t done 1
-
-# Complete multiple tasks
+# Complete tasks
 t done 1 2 3
+t done 1-3,5
 ```
 
 ## Commands Reference
+
+### Today Board
+
+```bash
+t              # same as `t today` (alias `t tb`)
+```
+
+Groups the filter `today | overdue | p3` as `🔴 P1 Focus`, `🟠 P2`, `🔵 P3 Optional`, `⚪ P4`.
+Session numbers run continuously from P1 downwards. Priority is inverted in the API
+(API 4 = P1); the CLI always shows and accepts P1-P4.
+
+```bash
+t focus 2          # priority P1 + due today (range forms work: 1,3-5)
+t quick 3,4        # adds @quick (keeps other labels) + due today
+```
+
+Recurring tasks keep their schedule: `focus` and `quick` do not reset their due date.
 
 ### Listing Tasks
 
 ```bash
 # Default: today + overdue
-t
-
-# Same as above
 t list
 
 # List all tasks
@@ -118,15 +150,18 @@ t list --all
 t list -a
 
 # Filter by project
-t list -p Work
-t list -p w          # using shortcut
+t list -p Research
+t list -p r          # using shortcut
+
+# Filter by section of a project (case-insensitive substring)
+t ls -p u -S sakshi
 
 # Filter by label
-t list -l urgent
-t list -l u          # using shortcut
+t list -l waiting
+t list -l w          # using shortcut
 
 # Use Todoist filter syntax
-t list -f "today & @work"
+t list -f "today & @waiting"
 t list -f "p1 | p2"
 t list -f "no date"
 
@@ -146,12 +181,16 @@ t list -t
 t add "Buy groceries"
 
 # With project (use -p flag for projects with spaces/emoji)
-t add "Review code" -p w
+t add "Review code" -p r
 t add "Call mom" -p Personal
 
+# An unknown -p project is an error (no silent Inbox fallback)
+# Into a section of the project (-p or inline #project required)
+t add "Reply about Ultima" -p u -S sakshi
+
 # With labels (inline)
-t add "Debug issue @coding @urgent"
-t add "Read paper @c"      # shortcut for @context/computer
+t add "Debug issue @quick @waiting"
+t add "Quick email @q"      # shortcut for @quick
 
 # With priority (p1=urgent/red, p4=low/default)
 t add "Critical fix p1"
@@ -176,13 +215,13 @@ When adding tasks, you can use inline syntax:
 
 | Syntax | Meaning | Example |
 |--------|---------|---------|
-| `@label` | Add label | `@work`, `@urgent` |
-| `p1`-`p4` | Set priority | `p4` (urgent), `p1` (normal) |
+| `@label` | Add label | `@quick`, `@waiting` |
+| `p1`-`p4` | Set priority | `p1` (urgent/focus), `p4` (normal) |
 | Natural language | Due date | `tomorrow`, `next week`, `jan 15` |
 
 Shortcuts are expanded automatically:
-- `@w` → `@work` (if configured)
-- `@c` → `@context/computer` (if configured)
+- `@q` → `@quick`, `@w` → `@waiting`
+- `#r` → `#🔬 Research`, `#u` → `#👥 Students` (and the rest of your project shortcuts)
 
 ### Completing Tasks
 
@@ -192,6 +231,7 @@ t done 1
 
 # Complete multiple tasks
 t done 1 2 3
+t done 1-3,5
 
 # Shortcut
 t d 1
@@ -210,7 +250,7 @@ t edit 1 -p 3
 t edit 1 --due "next monday"
 t edit 1 -d "tomorrow"
 
-t edit 1 --labels "work,urgent"
+t edit 1 --labels "quick"
 t edit 1 -l "coding"
 
 # Combine multiple changes
@@ -226,32 +266,32 @@ t edit 1 -i
 ```bash
 # Move to project
 t move 1 Inbox
-t move 1 Work
+t move 1 Research
 
 # Using shortcuts
-t move 1 w
+t move 1 r
 
 # Move multiple tasks
-t move 1,2,3 Work
+t move 1,2,3 Research
 t move 1-5 Personal    # range syntax
 
 # Shortcut
-t mv 1 w
+t mv 1 r
 ```
 
 ### Tagging Tasks
 
 ```bash
 # Add label to task
-t tag 1 urgent
-t tag 1 @work
+t tag 1 waiting
+t tag 1 @quick
 
 # Using shortcuts
-t tag 1 w              # adds @work
+t tag 1 w              # adds @waiting
 
 # Tag multiple tasks
-t tag 1,2,3 urgent
-t tag 1-5 coding       # range syntax
+t tag 1,2,3 waiting
+t tag 1-5 quick         # range syntax
 ```
 
 ### Rescheduling Tasks
@@ -270,6 +310,22 @@ t defer 1 +2w          # add 2 weeks
 t due 1 "next monday"
 t due 1 "jan 15"
 t due 1 "every day"    # recurring
+```
+
+### Deadlines
+
+A deadline is separate from the due date and shows as `⏰Mon DD` (red once past).
+
+```bash
+t deadline 1 2026-10-12     # set (ranges work: 1,3-5)
+t deadline 1 none           # clear
+```
+
+### Sections
+
+```bash
+t sections u        # sections of a project, as `project / section` (alias: t sec)
+t sections          # all sections, grouped by project
 ```
 
 ### Viewing Task Details
@@ -297,13 +353,13 @@ t comment 1 "Waiting for review"
 ### Deleting Tasks
 
 ```bash
-# Delete with confirmation
+# Delete with one confirmation listing every task
 t delete 1
-t rm 1
+t rm 1-3,5
 
 # Force delete (no confirmation)
 t delete 1 --force
-t rm 1 -f
+t rm 1-3 -f
 ```
 
 ### Configuration Commands
@@ -329,6 +385,8 @@ t config
 | `t move` | `t mv` |
 | `t view` | `t v` |
 | `t delete` | `t rm` |
+| `t today` | `t tb` (or bare `t`) |
+| `t sections` | `t sec` |
 
 ### Range Syntax
 
@@ -348,11 +406,11 @@ Tasks are assigned session numbers (1, 2, 3...) when you list them. These number
 
 - Are based on display order (overdue first, then today, then future)
 - Persist for 10 minutes between commands
-- Reset when you run a new `t list` command
+- Reset when you run a new `t list` / `t today` command
 
 **Workflow example:**
 ```bash
-t                  # List tasks, see numbers
+t                  # Today board, see numbers
 t done 1           # Complete task #1 (works because numbers persist)
 t bump 2           # Move task #2 to tomorrow
 t                  # Refresh the list (numbers may change)
@@ -390,10 +448,9 @@ t done 1 2
 ### Adding Tasks from Brain Dump
 
 ```bash
-t add "Email client about proposal @e p2 tomorrow" -p w
-t add "Review PR #123 @co p3 today" -p w
-t add "Buy birthday gift @h" -p p
-t add "Read chapter 5 @r" -p p
+t add "Email client about proposal @q p2 tomorrow" -p c
+t add "Review draft @w p3 today" -p r
+t add "Buy birthday gift @q" -p p
 ```
 
 ### Weekly Planning
@@ -403,10 +460,10 @@ t add "Read chapter 5 @r" -p p
 t list -a
 
 # Move tasks to this week's focus
-t move 5,8,12 Work
+t move 5,8,12 r
 
-# Tag batch for context
-t tag 1-5 focus
+# Tag batch
+t tag 1-5 q
 
 # Set due dates
 t due 1 "monday"
@@ -417,11 +474,11 @@ t due 3 "wednesday"
 ### Project Focus
 
 ```bash
-# List only work tasks
-t list -p w
+# List only research tasks
+t list -p r
 
 # Or with tree view for subtasks
-t list -p w --tree
+t list -p r --tree
 ```
 
 ## Configuration File Reference
@@ -434,31 +491,21 @@ Full `config.yml` structure:
 
 # Optional: Define shortcuts for faster input
 shortcuts:
-  # Label shortcuts: single char -> full label name
   labels:
-    w: work
-    h: home
-    c: context/computer
-    e: context/email
-    r: context/reading
-    l: context/lab
-    tq: time/quick
-    tl: time/long
-    tw: time/waiting
-    co: type/coding
-    wr: type/writing
-    an: type/analysis
-
-  # Project shortcuts: single char -> full project name
+    q: quick
+    w: waiting
   projects:
     i: Inbox
-    w: Work
-    p: Personal
-    t: Teaching
-
-  # Priority shortcuts (optional)
+    r: 🔬 Research
+    t: 🎓 Teaching
+    c: 🤝 Collabs
+    s: 🏛 Service
+    l: 🧰 Lab
+    p: 🏠 Personal
+    f: 💡 Someday
+    u: 👥 Students
   priorities:
-    u: p4    # 'u' becomes p4 (urgent)
+    u: p1
 
 # Auto-populated by 't sync' - don't edit manually
 cached:

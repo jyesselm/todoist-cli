@@ -2,11 +2,9 @@
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
-
-def _strip_emoji(text: str) -> str:
-    """Strip leading emoji and whitespace from text."""
-    return re.sub(r'^[\U0001F300-\U0001F9FF\U00002600-\U000026FF\U00002700-\U000027BF\s]+', '', text)
+from todoist_cli.shortcuts import strip_emoji
 
 
 @dataclass
@@ -161,7 +159,7 @@ class TaskParser:
         self,
         parsed: ParsedTask,
         project_lookup: dict[str, str] | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Convert parsed task to Todoist API parameters.
 
         Args:
@@ -171,7 +169,7 @@ class TaskParser:
         Returns:
             Dict of API parameters for task creation
         """
-        params: dict = {"content": parsed.content}
+        params: dict[str, Any] = {"content": parsed.content}
 
         if parsed.labels:
             params["labels"] = parsed.labels
@@ -185,17 +183,17 @@ class TaskParser:
 
         if parsed.project and project_lookup:
             # Look up project ID by name (case-insensitive, supports emoji and nested projects)
-            search = _strip_emoji(parsed.project.lower())
+            search = strip_emoji(parsed.project.lower())
             # First try exact match (with emoji stripped)
             for name, project_id in project_lookup.items():
-                if _strip_emoji(name).lower() == search:
+                if strip_emoji(name).lower() == search:
                     params["project_id"] = project_id
                     break
             else:
                 # Try partial match for nested projects (e.g., "work" -> "Work/Projects")
                 prefix = search + "/"
                 for name, project_id in project_lookup.items():
-                    stripped_name = _strip_emoji(name).lower()
+                    stripped_name = strip_emoji(name).lower()
                     if stripped_name.startswith(prefix):
                         params["project_id"] = project_id
                         break

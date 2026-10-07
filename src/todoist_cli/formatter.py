@@ -2,14 +2,14 @@
 
 from datetime import date, datetime
 
-from rich.console import Console
+from rich.console import Console, Group
+from rich.panel import Panel
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
-from rich.panel import Panel
-from rich.style import Style
 
-from todoist_cli.models import Task, Project, Label, Comment
+from todoist_cli.models import Comment, Label, Project, Task
 from todoist_cli.session import SessionCache
 
 
@@ -18,10 +18,10 @@ class TaskFormatter:
 
     # Priority colors (API uses inverted values: api_priority=4 means P1/urgent)
     PRIORITY_STYLES = {
-        4: Style(color="red", bold=True),      # API 4 = P1 - Urgent
+        4: Style(color="red", bold=True),  # API 4 = P1 - Urgent
         3: Style(color="orange1", bold=True),  # API 3 = P2 - High
-        2: Style(color="yellow"),              # API 2 = P3 - Medium
-        1: Style(color="white"),               # API 1 = P4 - Normal
+        2: Style(color="yellow"),  # API 2 = P3 - Medium
+        1: Style(color="white"),  # API 1 = P4 - Normal
     }
 
     PRIORITY_MARKERS = {
@@ -29,6 +29,13 @@ class TaskFormatter:
         3: "!!",
         2: "!",
         1: "",
+    }
+
+    PRIORITY_HEADINGS = {
+        4: "🔴 P1 Focus",
+        3: "🟠 P2",
+        2: "🔵 P3 Optional",
+        1: "⚪ P4",
     }
 
     # Todoist color name to Rich color mapping
@@ -63,7 +70,7 @@ class TaskFormatter:
     ):
         self._console = console
         self._projects = {p.id: p for p in (projects or [])}
-        self._labels = {l.name: l for l in (labels or [])}
+        self._labels = {lb.name: lb for lb in (labels or [])}
         self._project_colors = {
             p.id: self.COLOR_MAP.get(p.color, "white") for p in (projects or [])
         }
@@ -90,12 +97,13 @@ class TaskFormatter:
 
         table.add_column("#", style="dim", width=4, justify="right")
         table.add_column("Task", min_width=30)
-        table.add_column("Due", width=12, justify="right")
+        table.add_column("Due", width=20, justify="right")
         if show_project:
             table.add_column("Project", width=15)
         table.add_column("Labels", width=20)
 
-        for task in tasks:
+        ordered = sorted(tasks, key=lambda t: session_cache.get_session_num(t.id) or 0)
+        for task in ordered:
             num = session_cache.get_session_num(task.id)
             if num is None:
                 continue
@@ -117,6 +125,16 @@ class TaskFormatter:
             table.add_row(*row)
 
         return table
+
+    def format_by_priority(self, tasks: list[Task], session_cache: SessionCache) -> Group:
+        """Format tasks as one table per priority (P1 first), skipping empty groups."""
+        parts: list[Text | Table] = []
+        for api_pri in sorted(self.PRIORITY_HEADINGS, reverse=True):
+            group = [t for t in tasks if t.priority == api_pri]
+            if group:
+                parts.append(Text(f"\n{self.PRIORITY_HEADINGS[api_pri]}", style="bold"))
+                parts.append(self.format_task_list(group, session_cache))
+        return Group(*parts)
 
     def format_task_tree(
         self,
@@ -201,7 +219,25 @@ class TaskFormatter:
         return text
 
     def _format_due(self, task: Task) -> Text:
-        """Format due date with overdue highlighting."""
+        """Format due date with overdue highlighting, plus the deadline if set."""
+        if not task.due and task.deadline:
+            return Text(self._format_deadline(task.deadline).plain.strip(), style="dim")
+        text = self._format_due_only(task)
+        if task.deadline:
+            text.append_text(self._format_deadline(task.deadline))
+        return text
+
+    def _format_deadline(self, deadline: str) -> Text:
+        """Format a deadline as ` ⏰Mon DD` (red bold when past)."""
+        try:
+            day = datetime.strptime(deadline, "%Y-%m-%d").date()
+        except ValueError:
+            return Text(f" ⏰{deadline}", style="dim")
+        style = "red bold" if day < date.today() else "dim"
+        return Text(f" ⏰{day.strftime('%b %d')}", style=style)
+
+    def _format_due_only(self, task: Task) -> Text:
+        """Format the due date alone."""
         if not task.due:
             return Text("-", style="dim")
 
@@ -288,8 +324,13 @@ class TaskFormatter:
         content.append("\n")
 
         content.append("Due: ", style="bold")
-        content.append(self._format_due(task))
+        content.append(self._format_due_only(task))
         content.append("\n")
+
+        if task.deadline:
+            content.append("Deadline:", style="bold")
+            content.append_text(self._format_deadline(task.deadline))
+            content.append("\n")
 
         content.append("Project: ", style="bold")
         content.append(self._format_project(task))

@@ -2,12 +2,13 @@
 
 import json
 import os
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 import yaml
 
-from todoist_cli.models import Config, ShortcutConfig, CachedData, Project, Label
+from todoist_cli.models import Config, Label, Project, ShortcutConfig
 
 # Environment variable for API token (preferred for security)
 ENV_API_TOKEN = "TODOIST_API_TOKEN"
@@ -19,7 +20,8 @@ def _shared_token() -> str | None:
     """Read the token from the shared ~/.config/todoist/config.json, if present."""
     if not SHARED_TOKEN_FILE.exists():
         return None
-    return json.loads(SHARED_TOKEN_FILE.read_text()).get("token")
+    token = json.loads(SHARED_TOKEN_FILE.read_text()).get("token")
+    return str(token) if token else None
 
 
 class ConfigManager:
@@ -69,11 +71,7 @@ class ConfigManager:
         if not self._config_path.exists():
             if env_token:
                 # Create minimal config with env token
-                self._config = Config(
-                    api_token=env_token,
-                    shortcuts=ShortcutConfig(),
-                    cached=CachedData(),
-                )
+                self._config = Config.model_validate({"api-token": env_token})
                 return self._config
             raise FileNotFoundError(
                 f"Config file not found: {self._config_path}\n"
@@ -124,7 +122,7 @@ class ConfigManager:
         save_token = os.environ.get(ENV_API_TOKEN) is None and _shared_token() is None
 
         # Convert to dict with proper key names
-        data: dict = {}
+        data: dict[str, Any] = {}
 
         # Only include api-token if not using environment variable
         if save_token:
@@ -137,11 +135,9 @@ class ConfigManager:
         }
         data["cached"] = {
             "projects": [p.model_dump() for p in self._config.cached.projects],
-            "labels": [l.model_dump() for l in self._config.cached.labels],
+            "labels": [lb.model_dump() for lb in self._config.cached.labels],
             "last_sync": (
-                self._config.cached.last_sync.isoformat()
-                if self._config.cached.last_sync
-                else None
+                self._config.cached.last_sync.isoformat() if self._config.cached.last_sync else None
             ),
         }
 
@@ -179,9 +175,7 @@ class ConfigManager:
         """Get cached labels."""
         return self.load().cached.labels
 
-    def update_cached_data(
-        self, projects: list[Project], labels: list[Label]
-    ) -> None:
+    def update_cached_data(self, projects: list[Project], labels: list[Label]) -> None:
         """Update cached API data."""
         config = self.load()
         config.cached.projects = projects
@@ -189,9 +183,7 @@ class ConfigManager:
         config.cached.last_sync = datetime.now()
         self.save()
 
-    def add_shortcut(
-        self, shortcut_type: str, key: str, value: str
-    ) -> None:
+    def add_shortcut(self, shortcut_type: str, key: str, value: str) -> None:
         """Add a shortcut mapping.
 
         Args:

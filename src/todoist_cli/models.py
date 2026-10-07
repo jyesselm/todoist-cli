@@ -1,6 +1,7 @@
 """Pydantic models for Todoist entities and configuration."""
 
 from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
@@ -29,6 +30,7 @@ class Task(BaseModel):
     order: int = 0
     comment_count: int = 0
     is_completed: bool = False
+    deadline: str | None = None  # YYYY-MM-DD, separate from due
     created_at: str = ""
     creator_id: str = ""
     url: str = ""
@@ -43,6 +45,15 @@ class Project(BaseModel):
     parent_id: str | None = None
     order: int = 0
     is_favorite: bool = False
+
+
+class Section(BaseModel):
+    """Todoist section model."""
+
+    id: str
+    name: str
+    project_id: str
+    order: int = 0
 
 
 class Label(BaseModel):

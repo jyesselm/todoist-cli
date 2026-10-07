@@ -2,12 +2,14 @@
 
 import re
 
-from todoist_cli.models import ShortcutConfig, Project, Label
+from todoist_cli.models import Label, Project, ShortcutConfig
+
+_EMOJI_PREFIX = re.compile("^[\U0001f300-\U0001f9ff\U00002600-\U000026ff\U00002700-\U000027bf\\s]+")
 
 
-def _strip_emoji(text: str) -> str:
+def strip_emoji(text: str) -> str:
     """Strip leading emoji and whitespace from text."""
-    return re.sub(r'^[\U0001F300-\U0001F9FF\U00002600-\U000026FF\U00002700-\U000027BF\s]+', '', text)
+    return _EMOJI_PREFIX.sub("", text)
 
 
 class ShortcutExpander:
@@ -28,10 +30,8 @@ class ShortcutExpander:
         self._shortcuts = shortcuts
         self._projects = {p.name.lower(): p.name for p in (projects or [])}
         # Also store stripped versions (no emoji) for matching
-        self._projects_stripped = {
-            _strip_emoji(p.name).lower(): p.name for p in (projects or [])
-        }
-        self._labels = {l.name.lower(): l.name for l in (labels or [])}
+        self._projects_stripped = {strip_emoji(p.name).lower(): p.name for p in (projects or [])}
+        self._labels = {lb.name.lower(): lb.name for lb in (labels or [])}
 
         # Build reverse lookup: shortcut -> full name
         self._label_shortcuts = shortcuts.labels.copy()
@@ -72,13 +72,13 @@ class ShortcutExpander:
 
         return result
 
-    def _expand_label_match(self, match: re.Match) -> str:
+    def _expand_label_match(self, match: re.Match[str]) -> str:
         """Expand a label match."""
         label = match.group(1)
         expanded = self.expand_label(label)
         return f"@{expanded}" if expanded else match.group(0)
 
-    def _expand_project_match(self, match: re.Match) -> str:
+    def _expand_project_match(self, match: re.Match[str]) -> str:
         """Expand a project match."""
         project = match.group(1)
         expanded = self.expand_project(project)
@@ -110,7 +110,7 @@ class ShortcutExpander:
         Supports nested projects and emoji names: 'work' matches '🔵 Work'.
         """
         lower = shortcut.lower()
-        stripped = _strip_emoji(lower)
+        stripped = strip_emoji(lower)
 
         # Check shortcuts first
         if lower in self._project_shortcuts:

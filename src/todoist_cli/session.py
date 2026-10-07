@@ -4,6 +4,7 @@ import json
 import tempfile
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 from todoist_cli.models import Task
 
@@ -21,17 +22,18 @@ class SessionCache:
     3. Future tasks (by date)
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._num_to_id: dict[int, str] = {}
         self._id_to_num: dict[str, int] = {}
         self._tasks: dict[str, Task] = {}
         self._load_from_file()
 
-    def build_from_tasks(self, tasks: list[Task]) -> dict[int, str]:
+    def build_from_tasks(self, tasks: list[Task], by_priority: bool = False) -> dict[int, str]:
         """Build session number mapping from task list.
 
         Args:
             tasks: List of tasks to number
+            by_priority: Number highest priority first (used by the grouped board)
 
         Returns:
             Mapping of session number to task ID
@@ -41,7 +43,7 @@ class SessionCache:
         self._tasks.clear()
 
         # Sort tasks for consistent numbering
-        sorted_tasks = self._sort_tasks(tasks)
+        sorted_tasks = self._sort_tasks(tasks, by_priority)
 
         for i, task in enumerate(sorted_tasks, start=1):
             self._num_to_id[i] = task.id
@@ -53,11 +55,11 @@ class SessionCache:
 
         return self._num_to_id.copy()
 
-    def _sort_tasks(self, tasks: list[Task]) -> list[Task]:
+    def _sort_tasks(self, tasks: list[Task], by_priority: bool = False) -> list[Task]:
         """Sort tasks by due date, priority, then creation."""
         today = date.today()
 
-        def sort_key(task: Task) -> tuple:
+        def sort_key(task: Task) -> tuple[Any, ...]:
             # Parse due date
             if task.due:
                 try:
@@ -80,6 +82,8 @@ class SessionCache:
             # Priority is inverted (4 is urgent in Todoist)
             priority = -task.priority
 
+            if by_priority:
+                return (priority, category, due_date, task.created_at)
             return (category, due_date, priority, task.created_at)
 
         return sorted(tasks, key=sort_key)
@@ -102,9 +106,7 @@ class SessionCache:
 
         Skips invalid session numbers.
         """
-        return [
-            self._num_to_id[n] for n in session_nums if n in self._num_to_id
-        ]
+        return [self._num_to_id[n] for n in session_nums if n in self._num_to_id]
 
     def parse_range(self, range_str: str) -> list[int]:
         """Parse a range string into session numbers.
@@ -115,7 +117,7 @@ class SessionCache:
         - Ranges: "1-5" -> [1, 2, 3, 4, 5]
         - Mixed: "1,3-5,8" -> [1, 3, 4, 5, 8]
         """
-        result = []
+        result: list[int] = []
 
         for part in range_str.split(","):
             part = part.strip()
@@ -125,7 +127,9 @@ class SessionCache:
                     start, end = part.split("-", 1)
                     start_num = int(start.strip())
                     end_num = int(end.strip())
-                    result.extend(range(start_num, end_num + 1))
+                    result.extend(range(start_num, min(end_num, self.max_num) + 1))
+                    if end_num > self.max_num:
+                        result.append(end_num)  # kept so validate_nums reports the clip
                 except ValueError:
                     continue
             else:

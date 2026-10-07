@@ -1,14 +1,24 @@
 """Todoist API v1 client (REST v2 was retired with a 410 in 2026)."""
 
+from types import TracebackType
+from typing import Any, Self
+
 import httpx
 
-from todoist_cli.models import Task, Project, Label, Comment, DueDate
+from todoist_cli.models import Comment, DueDate, Label, Project, Section, Task
+
+
+class _Unset:
+    """Sentinel type: distinguishes "not passed" from an explicit None (clear)."""
+
+
+UNSET = _Unset()
 
 
 class TodoistError(Exception):
     """Base exception for Todoist API errors."""
 
-    def __init__(self, message: str, status_code: int | None = None):
+    def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
 
@@ -19,7 +29,7 @@ class TodoistClient:
     BASE_URL = "https://api.todoist.com/api/v1"
     PAGE_SIZE = 200
 
-    def __init__(self, api_token: str):
+    def __init__(self, api_token: str) -> None:
         """Initialize client with API token."""
         self._token = api_token
         self._client = httpx.Client(
@@ -32,30 +42,26 @@ class TodoistClient:
         self,
         method: str,
         endpoint: str,
-        params: dict | None = None,
-        json: dict | None = None,
-    ) -> dict | list | None:
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+    ) -> Any:
         """Make API request with error handling."""
         try:
-            response = self._client.request(
-                method, endpoint, params=params, json=json
-            )
+            response = self._client.request(method, endpoint, params=params, json=json)
             response.raise_for_status()
 
             if response.status_code == 204:
                 return None
             return response.json()
         except httpx.HTTPStatusError as e:
-            raise TodoistError(
-                f"API error: {e.response.text}", e.response.status_code
-            )
+            raise TodoistError(f"API error: {e.response.text}", e.response.status_code) from e
         except httpx.RequestError as e:
-            raise TodoistError(f"Request failed: {e}")
+            raise TodoistError(f"Request failed: {e}") from e
 
-    def _get_all(self, endpoint: str, params: dict | None = None) -> list[dict]:
+    def _get_all(self, endpoint: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """GET a v1 list endpoint, following `next_cursor` until exhausted."""
         params = dict(params or {}, limit=self.PAGE_SIZE)
-        items: list[dict] = []
+        items: list[dict[str, Any]] = []
         while True:
             page = self._request("GET", endpoint, params=params) or {}
             items.extend(page.get("results", []))
@@ -64,7 +70,7 @@ class TodoistClient:
                 return items
             params["cursor"] = cursor
 
-    def _parse_task(self, data: dict) -> Task:
+    def _parse_task(self, data: dict[str, Any]) -> Task:
         """Parse task data from API response (v1 field names)."""
         due = None
         if data.get("due"):
@@ -80,6 +86,7 @@ class TodoistClient:
             section_id=data.get("section_id"),
             parent_id=data.get("parent_id"),
             labels=data.get("labels", []),
+            deadline=(data.get("deadline") or {}).get("date"),
             order=data.get("child_order", 0),
             comment_count=data.get("note_count", 0),
             is_completed=data.get("checked", False),
@@ -88,7 +95,7 @@ class TodoistClient:
             url=f"https://app.todoist.com/app/task/{data['id']}",
         )
 
-    def _parse_project(self, data: dict) -> Project:
+    def _parse_project(self, data: dict[str, Any]) -> Project:
         """Parse project data from API response (v1 field names)."""
         return Project(
             id=data["id"],
@@ -97,6 +104,15 @@ class TodoistClient:
             parent_id=data.get("parent_id"),
             order=data.get("child_order", 0),
             is_favorite=data.get("is_favorite", False),
+        )
+
+    def _parse_section(self, data: dict[str, Any]) -> Section:
+        """Parse section data from API response (v1 field names)."""
+        return Section(
+            id=data["id"],
+            name=data["name"],
+            project_id=data["project_id"],
+            order=data.get("section_order", 0),
         )
 
     # ── Tasks ──────────────────────────────────────────────────────────────
@@ -119,7 +135,7 @@ class TodoistClient:
         if filter:
             data = self._get_all("/tasks/filter", {"query": filter})
         else:
-            params = {}
+            params: dict[str, Any] = {}
             if project_id:
                 params["project_id"] = project_id
             if section_id:
@@ -161,7 +177,7 @@ class TodoistClient:
             due_date: YYYY-MM-DD format
             due_datetime: RFC3339 datetime
         """
-        payload: dict = {"content": content}
+        payload: dict[str, Any] = {"content": content}
 
         if description:
             payload["description"] = description
@@ -195,9 +211,10 @@ class TodoistClient:
         priority: int | None = None,
         due_string: str | None = None,
         due_date: str | None = None,
+        deadline_date: str | None | _Unset = UNSET,
     ) -> Task:
-        """Update an existing task."""
-        payload: dict = {}
+        """Update an existing task. `deadline_date=None` clears the deadline."""
+        payload: dict[str, Any] = {}
 
         if content is not None:
             payload["content"] = content
@@ -213,6 +230,8 @@ class TodoistClient:
             payload["due_string"] = due_string
         if due_date is not None:
             payload["due_date"] = due_date
+        if not isinstance(deadline_date, _Unset):
+            payload["deadline_date"] = deadline_date
 
         data = self._request("POST", f"/tasks/{task_id}", json=payload)
         return self._parse_task(data)
@@ -239,6 +258,13 @@ class TodoistClient:
         """Get a single project by ID."""
         return self._parse_project(self._request("GET", f"/projects/{project_id}"))
 
+    # ── Sections ───────────────────────────────────────────────────────────
+
+    def get_sections(self, project_id: str | None = None) -> list[Section]:
+        """Get sections, optionally restricted to one project."""
+        params = {"project_id": project_id} if project_id else None
+        return [self._parse_section(s) for s in self._get_all("/sections", params)]
+
     # ── Labels ─────────────────────────────────────────────────────────────
 
     def get_labels(self) -> list[Label]:
@@ -246,13 +272,13 @@ class TodoistClient:
         data = self._get_all("/labels")
         return [
             Label(
-                id=l["id"],
-                name=l["name"],
-                color=l.get("color", "grey"),
-                order=l.get("order", 0),
-                is_favorite=l.get("is_favorite", False),
+                id=item["id"],
+                name=item["name"],
+                color=item.get("color", "grey"),
+                order=item.get("order", 0),
+                is_favorite=item.get("is_favorite", False),
             )
-            for l in data
+            for item in data
         ]
 
     # ── Comments ───────────────────────────────────────────────────────────
@@ -273,9 +299,7 @@ class TodoistClient:
 
     def create_comment(self, task_id: str, content: str) -> Comment:
         """Add a comment to a task."""
-        data = self._request(
-            "POST", "/comments", json={"task_id": task_id, "content": content}
-        )
+        data = self._request("POST", "/comments", json={"task_id": task_id, "content": content})
         return Comment(
             id=data["id"],
             task_id=data.get("task_id"),
@@ -288,8 +312,13 @@ class TodoistClient:
         """Close the HTTP client."""
         self._client.close()
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *args):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()

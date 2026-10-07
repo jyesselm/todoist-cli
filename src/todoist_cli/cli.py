@@ -1,20 +1,22 @@
 """Todoist CLI - Main command interface."""
 
+from collections.abc import Iterator
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
-from rich.prompt import Prompt, IntPrompt, Confirm
+from rich.prompt import Confirm, IntPrompt, Prompt
 
 from todoist_cli.client import TodoistClient, TodoistError
 from todoist_cli.config import ConfigManager
 from todoist_cli.formatter import TaskFormatter
-from todoist_cli.models import Project, Label
+from todoist_cli.models import Label, Project, Section, Task
 from todoist_cli.parser import TaskParser
 from todoist_cli.session import SessionCache
-from todoist_cli.shortcuts import ShortcutExpander
+from todoist_cli.shortcuts import ShortcutExpander, strip_emoji
+
+TODAY_FILTER = "today | overdue | p3"
 
 app = typer.Typer(
     name="t",
@@ -102,13 +104,6 @@ def get_project_lookup() -> dict[str, str]:
     return {p.name: p.id for p in projects}
 
 
-def _strip_emoji(text: str) -> str:
-    """Strip leading emoji and whitespace from text."""
-    import re
-    # Remove leading emoji (Unicode ranges for common emoji)
-    return re.sub(r'^[\U0001F300-\U0001F9FF\U00002600-\U000026FF\U00002700-\U000027BF\s]+', '', text)
-
-
 def _build_project_paths() -> dict[str, tuple[str, str]]:
     """Build full project paths using parent_id relationships.
 
@@ -132,7 +127,7 @@ def _build_project_paths() -> dict[str, tuple[str, str]]:
 
         full_path = "/".join(path_parts)
         # Create stripped version for matching (no emoji)
-        stripped_parts = [_strip_emoji(p) for p in path_parts]
+        stripped_parts = [strip_emoji(p) for p in path_parts]
         stripped_path = "/".join(stripped_parts)
 
         paths[project.id] = (full_path, stripped_path)
@@ -177,7 +172,7 @@ def find_project_id(project_name: str, project_lookup: dict[str, str]) -> str | 
     3. Partial path match (e.g., 'work/proj' matches 'Work/Projects')
     """
     lower = project_name.lower()
-    stripped_search = _strip_emoji(lower)
+    stripped_search = strip_emoji(lower)
 
     # Build project paths with hierarchy
     project_paths = _build_project_paths()
@@ -185,7 +180,7 @@ def find_project_id(project_name: str, project_lookup: dict[str, str]) -> str | 
     # First: exact match on the project's own name (ignoring emoji)
     projects, _ = get_projects_and_labels()
     for project in projects:
-        if _strip_emoji(project.name).lower() == stripped_search:
+        if strip_emoji(project.name).lower() == stripped_search:
             return project.id
 
     # Second: match if search term matches start of any path component
@@ -203,7 +198,7 @@ def find_project_id(project_name: str, project_lookup: dict[str, str]) -> str | 
     return None
 
 
-def get_task_by_num(num: int) -> tuple[str | None, "Task | None"]:
+def get_task_by_num(num: int) -> tuple[str | None, Task | None]:
     """Get task ID and Task object by session number.
 
     Fetches from API if not in cache.
@@ -211,8 +206,6 @@ def get_task_by_num(num: int) -> tuple[str | None, "Task | None"]:
     Returns:
         Tuple of (task_id, task) - both None if not found
     """
-    from todoist_cli.models import Task
-
     task_id = _session_cache.get_task_id(num)
     if not task_id:
         return None, None
@@ -227,17 +220,132 @@ def get_task_by_num(num: int) -> tuple[str | None, "Task | None"]:
     return task_id, task
 
 
+def _iter_tasks(nums: str) -> Iterator[tuple[int, str, Task]]:
+    """Yield (num, task_id, task) for each valid session number in a range string.
+
+    Exits with an error on unparseable input, or if no task ends up being processed.
+    """
+    formatter = get_formatter()
+    parsed = _session_cache.parse_range(nums)
+    if not parsed:
+        formatter.format_error(f"Invalid task numbers: {nums!r}")
+        raise typer.Exit(1)
+    valid, invalid = _session_cache.validate_nums(parsed)
+    if invalid:
+        formatter.format_warning(f"Invalid task numbers: {invalid}")
+    count = 0
+    for num in valid:
+        task_id, task = get_task_by_num(num)
+        if not task_id or not task:
+            formatter.format_warning(f"Task #{num} could not be loaded")
+            continue
+        count += 1
+        yield num, task_id, task
+    if count == 0:
+        formatter.format_error("No tasks processed. Run 't list' first.")
+        raise typer.Exit(1)
+
+
+def _fresh_labels(task_id: str, num: int) -> list[str] | None:
+    """Re-read a task's labels so a rewrite never clobbers changes made elsewhere."""
+    try:
+        return get_client().get_task(task_id).labels
+    except TodoistError:
+        get_formatter().format_warning(f"Task #{num} could not be reloaded; skipped")
+        return None
+
+
+def _resolve_project(project: str) -> tuple[str, str]:
+    """Resolve a project shortcut/name to (display name, id), exiting if not found."""
+    name = get_expander().expand_project(project.lstrip("#")) or project
+    project_id = find_project_id(name, get_project_lookup())
+    if not project_id:
+        get_formatter().format_error(f"Project not found: {project}")
+        raise typer.Exit(1)
+    return name, project_id
+
+
+def _resolve_section(project_id: str, section: str) -> str:
+    """Find a section id in a project (exact name, else a unique substring), or exit."""
+    formatter = get_formatter()
+    needle = section.strip().lower()
+    if not needle:
+        formatter.format_error("Section name is empty")
+        raise typer.Exit(1)
+    sections: list[Section] = get_client().get_sections(project_id)
+    exact = [s for s in sections if s.name.lower() == needle]
+    found = exact or [s for s in sections if needle in s.name.lower()]
+    if not found:
+        formatter.format_error(f"Section not found: {section}")
+        raise typer.Exit(1)
+    if len(found) > 1:
+        names = ", ".join(s.name for s in found)
+        formatter.format_error(f"Section '{section}' is ambiguous: {names}")
+        raise typer.Exit(1)
+    return found[0].id
+
+
+def _is_recurring(task: Task) -> bool:
+    """Whether the task repeats (moving its due date would destroy the recurrence)."""
+    return bool(task.due and task.due.is_recurring)
+
+
+def _due_today(task: Task) -> dict[str, Any]:
+    """Params that move a task to today; recurring tasks keep their schedule."""
+    return {} if _is_recurring(task) else {"due_string": "today"}
+
+
+def _recurring_note(task: Task) -> str:
+    """Suffix for success lines when a recurring task's date was left alone."""
+    return " (recurring, date unchanged)" if _is_recurring(task) else ""
+
+
 # ── Default Command ────────────────────────────────────────────────────────
 
 
 @app.callback(invoke_without_command=True)
-def main(ctx: typer.Context):
-    """Show today's tasks and overdue items."""
+def main(ctx: typer.Context) -> None:
+    """Show the Today board (today | overdue | p3, grouped by priority)."""
     if ctx.invoked_subcommand is None:
-        list_tasks()
+        today_board()
+
+
+# ── Today Board ────────────────────────────────────────────────────────────
+
+
+@app.command("today")
+@app.command("tb")
+def today_board() -> None:
+    """Show the Today board grouped by priority (P1 focus first)."""
+    try:
+        tasks = get_client().get_tasks(filter=TODAY_FILTER)
+        if not tasks:
+            _session_cache.build_from_tasks([])
+            console.print("[dim]No tasks found[/dim]")
+            raise typer.Exit(0)
+        _session_cache.build_from_tasks(tasks, by_priority=True)
+        console.print(get_formatter().format_by_priority(tasks, _session_cache))
+        console.print(f"\n[dim]{len(tasks)} task(s)[/dim]")
+    except TodoistError as e:
+        get_formatter().format_error(str(e))
+        raise typer.Exit(1) from e
 
 
 # ── List Tasks ─────────────────────────────────────────────────────────────
+
+
+def _project_tasks(project: str, nested: bool, section: str | None) -> list[Task]:
+    """Tasks of a project, optionally restricted to a section or including children."""
+    client = get_client()
+    _, project_id = _resolve_project(project)
+    if section is not None:
+        section_id = _resolve_section(project_id, section)
+        return client.get_tasks(project_id=project_id, section_id=section_id)
+    if nested:
+        # Fetch all tasks once and filter locally (much faster than one call per project)
+        ids = set(find_nested_project_ids(project_id))
+        return [t for t in client.get_tasks() if t.project_id in ids]
+    return client.get_tasks(project_id=project_id)
 
 
 @app.command("list")
@@ -248,7 +356,7 @@ def list_tasks(
         typer.Option("-f", "--filter", help="Todoist filter query"),
     ] = "today | overdue",
     project: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("-p", "--project", help="Filter by project"),
     ] = None,
     nested: Annotated[
@@ -256,7 +364,7 @@ def list_tasks(
         typer.Option("-n", "--nested", help="Include nested/child projects"),
     ] = False,
     label: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("-l", "--label", help="Filter by label"),
     ] = None,
     untagged: Annotated[
@@ -264,7 +372,7 @@ def list_tasks(
         typer.Option("-u", "--untagged", help="Show only tasks without any labels"),
     ] = False,
     search: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("-s", "--search", help="Text search in task content"),
     ] = None,
     tree: Annotated[
@@ -275,37 +383,24 @@ def list_tasks(
         bool,
         typer.Option("--all", "-a", help="Show all tasks (no filter)"),
     ] = False,
-):
+    section: Annotated[
+        str | None,
+        typer.Option("-S", "--section", help="Section of the -p project (name substring)"),
+    ] = None,
+) -> None:
     """List tasks with optional filtering."""
     try:
-        client = get_client()
         formatter = get_formatter()
-
-        # Build query params
+        client = get_client()
+        if section is not None and not project:
+            formatter.format_error("--section requires -p/--project")
+            raise typer.Exit(1)
         if all_tasks:
             tasks = client.get_tasks()
         elif project:
-            # Expand project shortcut
-            expander = get_expander()
-            project_name = expander.expand_project(project)
-            project_lookup = get_project_lookup()
-            project_id = find_project_id(project_name, project_lookup)
-            if project_id:
-                if nested:
-                    # Get tasks from this project and all nested children
-                    # Fetch all tasks once and filter locally (much faster than multiple API calls)
-                    all_project_ids = set(find_nested_project_ids(project_id))
-                    all_tasks = client.get_tasks()
-                    tasks = [t for t in all_tasks if t.project_id in all_project_ids]
-                else:
-                    tasks = client.get_tasks(project_id=project_id)
-            else:
-                formatter.format_error(f"Project not found: {project}")
-                raise typer.Exit(1)
+            tasks = _project_tasks(project, nested, section)
         elif label:
-            expander = get_expander()
-            label_name = expander.expand_label(label)
-            tasks = client.get_tasks(label=label_name)
+            tasks = client.get_tasks(label=get_expander().expand_label(label))
         else:
             tasks = client.get_tasks(filter=filter)
 
@@ -319,6 +414,7 @@ def list_tasks(
             tasks = [t for t in tasks if not t.labels]
 
         if not tasks:
+            _session_cache.build_from_tasks([])
             console.print("[dim]No tasks found[/dim]")
             raise typer.Exit(0)
 
@@ -327,17 +423,14 @@ def list_tasks(
 
         # Display
         if tree:
-            output = formatter.format_task_tree(tasks, _session_cache)
+            console.print(formatter.format_task_tree(tasks, _session_cache))
         else:
-            output = formatter.format_task_list(tasks, _session_cache)
-
-        console.print(output)
+            console.print(formatter.format_task_list(tasks, _session_cache))
         console.print(f"\n[dim]{len(tasks)} task(s)[/dim]")
 
     except TodoistError as e:
-        formatter = get_formatter()
-        formatter.format_error(str(e))
-        raise typer.Exit(1)
+        get_formatter().format_error(str(e))
+        raise typer.Exit(1) from e
 
 
 # ── Add Task ───────────────────────────────────────────────────────────────
@@ -348,31 +441,36 @@ def list_tasks(
 def add_task(
     content: Annotated[str, typer.Argument(help="Task content with inline syntax")],
     parent: Annotated[
-        Optional[int],
+        int | None,
         typer.Option("-P", "--parent", help="Parent task session number"),
     ] = None,
     project: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("-p", "--project", help="Project (name or shortcut)"),
     ] = None,
     description: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("-d", "--description", help="Task description"),
     ] = None,
-):
+    section: Annotated[
+        str | None,
+        typer.Option("-S", "--section", help="Section of the project (name substring)"),
+    ] = None,
+) -> None:
     """Add a new task.
 
     Supports inline syntax:
-    - @label for labels (or shortcuts like @c for @context/computer)
+    - @label for labels (or shortcuts like @q for @quick)
     - p1-p4 for priority
     - Natural language dates: "tomorrow", "next monday", etc.
 
-    Use -p for projects with spaces/emoji: t add "task" -p w
+    Use -p for projects with spaces/emoji: t add "task" -p s
 
     Examples:
-        t add "Review PR @c p2 tomorrow"
-        t add "Fix bug" -p w
+        t add "Reply to Swati @q tomorrow" -p s
+        t add "Fix bug" -p l
         t add "Subtask" --parent 1
+        t add "Reply to Sakshi" -p u -S sakshi
     """
     try:
         client = get_client()
@@ -391,11 +489,14 @@ def add_task(
 
         # Handle project option (takes precedence over inline #project)
         if project:
-            project_name = expander.expand_project(project.lstrip("#"))
-            project_lookup = get_project_lookup()
-            project_id = find_project_id(project_name, project_lookup)
-            if project_id:
-                params["project_id"] = project_id
+            params["project_id"] = _resolve_project(project)[1]
+
+        # Handle section (needs a project, from -p or inline #project)
+        if section is not None:
+            if "project_id" not in params:
+                formatter.format_error("--section requires -p or an inline #project")
+                raise typer.Exit(1)
+            params["section_id"] = _resolve_section(params["project_id"], section)
 
         # Handle parent task
         if parent:
@@ -403,9 +504,7 @@ def add_task(
             if parent_id:
                 params["parent_id"] = parent_id
             else:
-                formatter.format_warning(
-                    f"Parent #{parent} not found. Creating as top-level task."
-                )
+                formatter.format_warning(f"Parent #{parent} not found. Creating as top-level task.")
 
         # Add description
         if description:
@@ -443,38 +542,99 @@ def add_task(
 @app.command("d")
 def complete_tasks(
     nums: Annotated[
-        list[int],
-        typer.Argument(help="Session numbers to complete"),
+        list[str],
+        typer.Argument(help="Session numbers or ranges to complete"),
     ],
-):
+) -> None:
     """Complete one or more tasks by session number.
 
     Examples:
         t done 1
         t done 1 2 3
+        t done 1-3,5
     """
     try:
         client = get_client()
-        formatter = get_formatter()
-
-        valid, invalid = _session_cache.validate_nums(nums)
-
-        if invalid:
-            formatter.format_warning(f"Invalid task numbers: {invalid}")
-
-        for num in valid:
-            task_id = _session_cache.get_task_id(num)
-            if task_id:
-                # Get task content for display
-                task = _session_cache.get_task(num)
-                if not task:
-                    task = client.get_task(task_id)
-                client.close_task(task_id)
-                formatter.format_success(f"Completed: {task.content}")
+        for _, task_id, task in _iter_tasks(",".join(nums)):
+            client.close_task(task_id)
+            get_formatter().format_success(f"Completed: {task.content}")
 
     except TodoistError as e:
         get_formatter().format_error(str(e))
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
+
+
+# ── Focus / Quick / Deadline ───────────────────────────────────────────────
+
+
+@app.command("focus")
+def focus_tasks(
+    nums: Annotated[str, typer.Argument(help="Task numbers (e.g., '1' or '1,3-5')")],
+) -> None:
+    """Make tasks today's P1 focus (priority P1 + due today).
+
+    Example:
+        t focus 2
+    """
+    try:
+        client = get_client()
+        for _, task_id, task in _iter_tasks(nums):
+            client.update_task(task_id, priority=4, **_due_today(task))
+            get_formatter().format_success(f"Focus: {task.content}{_recurring_note(task)}")
+    except TodoistError as e:
+        get_formatter().format_error(str(e))
+        raise typer.Exit(1) from e
+
+
+@app.command("quick")
+def quick_tasks(
+    nums: Annotated[str, typer.Argument(help="Task numbers (e.g., '1' or '1,3-5')")],
+) -> None:
+    """Mark tasks as quick wins (@quick label + due today).
+
+    Example:
+        t quick 3,4
+    """
+    try:
+        client = get_client()
+        for num, task_id, task in _iter_tasks(nums):
+            current = _fresh_labels(task_id, num)
+            if current is None:
+                continue
+            client.update_task(task_id, labels=sorted({*current, "quick"}), **_due_today(task))
+            get_formatter().format_success(f"Quick: {task.content}{_recurring_note(task)}")
+    except TodoistError as e:
+        get_formatter().format_error(str(e))
+        raise typer.Exit(1) from e
+
+
+@app.command("deadline")
+def set_deadline(
+    nums: Annotated[str, typer.Argument(help="Task numbers (e.g., '1' or '1,3-5')")],
+    date: Annotated[str, typer.Argument(help="YYYY-MM-DD, or 'none' to clear")],
+) -> None:
+    """Set (or clear) the hard deadline on tasks.
+
+    Examples:
+        t deadline 1 2026-10-12
+        t deadline 1-3 none
+    """
+    value: str | None = None
+    if date.lower() != "none":
+        try:
+            value = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            get_formatter().format_error("DATE must be YYYY-MM-DD or 'none'")
+            raise typer.Exit(1) from None
+    try:
+        client = get_client()
+        for _, task_id, task in _iter_tasks(nums):
+            client.update_task(task_id, deadline_date=value)
+            what = f"deadline {value}" if value else "no deadline"
+            get_formatter().format_success(f"Set {what}: {task.content}")
+    except TodoistError as e:
+        get_formatter().format_error(str(e))
+        raise typer.Exit(1) from e
 
 
 # ── Edit Task ──────────────────────────────────────────────────────────────
@@ -485,26 +645,26 @@ def complete_tasks(
 def edit_task(
     num: Annotated[int, typer.Argument(help="Task session number")],
     content: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("-c", "--content", help="New task content"),
     ] = None,
     priority: Annotated[
-        Optional[int],
+        int | None,
         typer.Option("-p", "--priority", help="Priority (1-4, 1=urgent)"),
     ] = None,
     due: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("-d", "--due", help="Due date (natural language)"),
     ] = None,
     labels: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("-l", "--labels", help="Labels (comma-separated)"),
     ] = None,
     interactive: Annotated[
         bool,
         typer.Option("-i", "--interactive", help="Interactive editing mode"),
     ] = False,
-):
+) -> None:
     """Edit a task.
 
     Examples:
@@ -541,9 +701,7 @@ def edit_task(
             labels_str = ",".join(task.labels)
             labels_input = Prompt.ask("Labels (comma-sep)", default=labels_str)
             labels_list = (
-                [l.strip() for l in labels_input.split(",") if l.strip()]
-                if labels_input
-                else None
+                [x.strip() for x in labels_input.split(",") if x.strip()] if labels_input else None
             )
 
             updated = client.update_task(
@@ -555,7 +713,7 @@ def edit_task(
             )
         else:
             # Flag-based editing
-            update_params: dict = {}
+            update_params: dict[str, Any] = {}
             if content:
                 update_params["content"] = content
             if priority:
@@ -563,7 +721,7 @@ def edit_task(
             if due:
                 update_params["due_string"] = due
             if labels:
-                update_params["labels"] = [l.strip() for l in labels.split(",")]
+                update_params["labels"] = [x.strip() for x in labels.split(",")]
 
             if not update_params:
                 formatter.format_error("No changes specified. Use flags or --interactive")
@@ -586,7 +744,7 @@ def edit_task(
 def move_tasks(
     nums: Annotated[str, typer.Argument(help="Task numbers (e.g., '1,2,3' or '1-5')")],
     project: Annotated[str, typer.Argument(help="Target project (name or shortcut)")],
-):
+) -> None:
     """Move tasks to a different project.
 
     Examples:
@@ -596,31 +754,11 @@ def move_tasks(
     """
     try:
         client = get_client()
-        formatter = get_formatter()
-        expander = get_expander()
+        project_name, project_id = _resolve_project(project)
 
-        # Parse task numbers
-        task_nums = _session_cache.parse_range(nums)
-        valid, invalid = _session_cache.validate_nums(task_nums)
-
-        if invalid:
-            formatter.format_warning(f"Invalid task numbers: {invalid}")
-
-        # Expand project shortcut
-        project_name = expander.expand_project(project.lstrip("#"))
-        project_lookup = get_project_lookup()
-        project_id = find_project_id(project_name, project_lookup)
-
-        if not project_id:
-            formatter.format_error(f"Project not found: {project}")
-            raise typer.Exit(1)
-
-        # Move each task
-        for num in valid:
-            task_id, task = get_task_by_num(num)
-            if task_id and task:
-                client.update_task(task_id, project_id=project_id)
-                formatter.format_success(f"Moved '{task.content}' to {project_name}")
+        for _, task_id, task in _iter_tasks(nums):
+            client.update_task(task_id, project_id=project_id)
+            get_formatter().format_success(f"Moved '{task.content}' to {project_name}")
 
     except TodoistError as e:
         get_formatter().format_error(str(e))
@@ -634,36 +772,24 @@ def move_tasks(
 def tag_tasks(
     nums: Annotated[str, typer.Argument(help="Task numbers (e.g., '1,2,3' or '1-5')")],
     label: Annotated[str, typer.Argument(help="Label to add (name or shortcut)")],
-):
+) -> None:
     """Add a label to tasks.
 
     Examples:
         t tag 1 urgent
-        t tag 1-5 @work
-        t tag 1,2,3 w
+        t tag 1-5 @waiting
+        t tag 1,2,3 q
     """
     try:
         client = get_client()
-        formatter = get_formatter()
-        expander = get_expander()
+        label_name = get_expander().expand_label(label.lstrip("@")) or label
 
-        # Parse task numbers
-        task_nums = _session_cache.parse_range(nums)
-        valid, invalid = _session_cache.validate_nums(task_nums)
-
-        if invalid:
-            formatter.format_warning(f"Invalid task numbers: {invalid}")
-
-        # Expand label shortcut
-        label_name = expander.expand_label(label.lstrip("@"))
-
-        # Tag each task
-        for num in valid:
-            task_id, task = get_task_by_num(num)
-            if task_id and task:
-                new_labels = list(set(task.labels + [label_name]))
-                client.update_task(task_id, labels=new_labels)
-                formatter.format_success(f"Tagged '{task.content}' with @{label_name}")
+        for num, task_id, task in _iter_tasks(nums):
+            current = _fresh_labels(task_id, num)
+            if current is None:
+                continue
+            client.update_task(task_id, labels=sorted({*current, label_name}))
+            get_formatter().format_success(f"Tagged '{task.content}' with @{label_name}")
 
     except TodoistError as e:
         get_formatter().format_error(str(e))
@@ -678,7 +804,7 @@ def tag_tasks(
 def set_priority(
     nums: Annotated[str, typer.Argument(help="Task numbers (e.g., '1,2,3' or '1-5')")],
     priority: Annotated[str, typer.Argument(help="Priority: p1/p2/p3/p4 or 1/2/3/4 (1=urgent)")],
-):
+) -> None:
     """Set priority on tasks.
 
     Priority levels (Todoist convention):
@@ -696,13 +822,6 @@ def set_priority(
         client = get_client()
         formatter = get_formatter()
 
-        # Parse task numbers
-        task_nums = _session_cache.parse_range(nums)
-        valid, invalid = _session_cache.validate_nums(task_nums)
-
-        if invalid:
-            formatter.format_warning(f"Invalid task numbers: {invalid}")
-
         # Parse priority (accept p1-p4 or just 1-4)
         # User-facing: p1=urgent, p4=low
         # API values:  4=urgent,  1=low (inverted!)
@@ -713,18 +832,16 @@ def set_priority(
                 raise ValueError()
         except ValueError:
             formatter.format_error("Priority must be p1-p4 or 1-4")
-            raise typer.Exit(1)
+            raise typer.Exit(1) from None
 
         # Convert user-facing priority to API value (invert: p1->4, p2->3, p3->2, p4->1)
         api_pri = 5 - user_pri
 
         # Set priority on each task
         pri_names = {1: "urgent", 2: "high", 3: "medium", 4: "low"}
-        for num in valid:
-            task_id, task = get_task_by_num(num)
-            if task_id and task:
-                client.update_task(task_id, priority=api_pri)
-                formatter.format_success(f"Set '{task.content}' to {pri_names[user_pri]} (p{user_pri})")
+        for _, task_id, task in _iter_tasks(nums):
+            client.update_task(task_id, priority=api_pri)
+            formatter.format_success(f"Set '{task.content}' to {pri_names[user_pri]} (p{user_pri})")
 
     except TodoistError as e:
         get_formatter().format_error(str(e))
@@ -737,7 +854,7 @@ def set_priority(
 @app.command("bump")
 def bump_task(
     num: Annotated[int, typer.Argument(help="Task session number")],
-):
+) -> None:
     """Move task to tomorrow.
 
     Example:
@@ -766,7 +883,7 @@ def bump_task(
 def defer_task(
     num: Annotated[int, typer.Argument(help="Task session number")],
     offset: Annotated[str, typer.Argument(help="Time offset (e.g., '+3d', '+1w')")],
-):
+) -> None:
     """Defer task by a time offset.
 
     Supports:
@@ -811,9 +928,7 @@ def defer_task(
 
         client.update_task(task_id, due_date=new_date_str)
         content = task.content if task else f"Task {task_id}"
-        formatter.format_success(
-            f"Deferred '{content}' to {new_date.strftime('%b %d')}"
-        )
+        formatter.format_success(f"Deferred '{content}' to {new_date.strftime('%b %d')}")
 
     except (ValueError, TodoistError) as e:
         get_formatter().format_error(str(e))
@@ -824,7 +939,7 @@ def defer_task(
 def set_due(
     num: Annotated[int, typer.Argument(help="Task session number")],
     date: Annotated[str, typer.Argument(help="Due date (natural language)")],
-):
+) -> None:
     """Set task due date.
 
     Examples:
@@ -859,7 +974,7 @@ def set_due(
 @app.command("comments")
 def show_comments(
     num: Annotated[int, typer.Argument(help="Task session number")],
-):
+) -> None:
     """View comments on a task.
 
     Example:
@@ -889,7 +1004,7 @@ def show_comments(
 def add_comment(
     num: Annotated[int, typer.Argument(help="Task session number")],
     text: Annotated[str, typer.Argument(help="Comment text")],
-):
+) -> None:
     """Add a comment to a task.
 
     Example:
@@ -924,7 +1039,7 @@ def list_projects(
         bool,
         typer.Option("--flat", "-f", help="Show flat list instead of tree"),
     ] = False,
-):
+) -> None:
     """List all projects.
 
     Shows projects in a tree structure by default.
@@ -951,7 +1066,7 @@ def list_projects(
         roots = [p for p in projects if not p.parent_id]
 
         # Build children map
-        children_map: dict[str, list] = {}
+        children_map: dict[str, list[Project]] = {}
         for p in projects:
             if p.parent_id:
                 if p.parent_id not in children_map:
@@ -962,7 +1077,7 @@ def list_projects(
         for pid in children_map:
             children_map[pid].sort(key=lambda p: p.order)
 
-        def print_tree(project, prefix="", is_last=True):
+        def print_tree(project: Project, prefix: str = "", is_last: bool = True) -> None:
             connector = "└── " if is_last else "├── "
             console.print(f"{prefix}{connector}{project.name}")
             children = children_map.get(project.id, [])
@@ -979,7 +1094,7 @@ def list_projects(
 
 
 @app.command("labels")
-def list_labels():
+def list_labels() -> None:
     """List all labels.
 
     Example:
@@ -991,17 +1106,47 @@ def list_labels():
         console.print("[dim]No labels found[/dim]")
         raise typer.Exit(0)
 
-    for label in sorted(labels, key=lambda l: l.name.lower()):
+    for label in sorted(labels, key=lambda lb: lb.name.lower()):
         console.print(f"  @{label.name}")
 
     console.print(f"\n[dim]{len(labels)} label(s)[/dim]")
+
+
+@app.command("sections")
+@app.command("sec")
+def list_sections(
+    project: Annotated[
+        str | None,
+        typer.Argument(help="Project (name or shortcut); omit for all projects"),
+    ] = None,
+) -> None:
+    """List sections as `project / section`.
+
+    Examples:
+        t sections u
+        t sec
+    """
+    try:
+        projects, _ = get_projects_and_labels()
+        project_id = _resolve_project(project)[1] if project else None
+        sections = get_client().get_sections(project_id)
+        rank = {p.id: (p.order, p.name) for p in projects}
+        names = {p.id: p.name for p in projects}
+        sections.sort(key=lambda s: (rank.get(s.project_id, (0, "")), s.order))
+        for sec in sections:
+            console.print(f"  {names.get(sec.project_id, sec.project_id)} / {sec.name}")
+        if not sections:
+            console.print("[dim]No sections found[/dim]")
+    except TodoistError as e:
+        get_formatter().format_error(str(e))
+        raise typer.Exit(1) from e
 
 
 # ── Sync / Config ──────────────────────────────────────────────────────────
 
 
 @app.command("sync")
-def sync_config():
+def sync_config() -> None:
     """Sync labels and projects from Todoist.
 
     Fetches current labels and projects and updates local cache.
@@ -1040,7 +1185,7 @@ def sync_config():
                 "\n[dim]No shortcuts defined. Add them to config.yml:[/dim]\n"
                 "  shortcuts:\n"
                 "    labels:\n"
-                "      w: work\n"
+                "      q: quick\n"
                 "    projects:\n"
                 "      i: Inbox"
             )
@@ -1051,7 +1196,7 @@ def sync_config():
 
 
 @app.command("config")
-def show_config():
+def show_config() -> None:
     """Show current configuration."""
     config = get_config()
 
@@ -1087,7 +1232,7 @@ def show_config():
 @app.command("v")
 def view_task(
     num: Annotated[int, typer.Argument(help="Task session number")],
-):
+) -> None:
     """View task details.
 
     Example:
@@ -1120,44 +1265,35 @@ def view_task(
 @app.command("delete")
 @app.command("rm")
 def delete_task(
-    num: Annotated[int, typer.Argument(help="Task session number")],
+    nums: Annotated[list[str], typer.Argument(help="Task numbers (e.g., '1 2' or '1-3,5')")],
     force: Annotated[
         bool,
         typer.Option("-f", "--force", help="Skip confirmation"),
     ] = False,
-):
-    """Delete a task.
+) -> None:
+    """Delete tasks (one confirmation listing all of them).
 
     Example:
         t delete 1
-        t rm 1 -f
+        t rm 1-3 -f
     """
     try:
         client = get_client()
-        formatter = get_formatter()
-
-        task_id = _session_cache.get_task_id(num)
-
-        if not task_id:
-            formatter.format_error(f"Task #{num} not found. Run 't list' first.")
-            raise typer.Exit(1)
-
-        # Try to get task from cache, otherwise fetch from API
-        task = _session_cache.get_task(num)
-        if not task:
-            task = client.get_task(task_id)
+        items = list(_iter_tasks(",".join(nums)))
 
         if not force:
-            if not Confirm.ask(f"Delete '{task.content}'?"):
+            listing = "\n".join(f"  - {task.content}" for _, _, task in items)
+            if not Confirm.ask(f"Delete {len(items)} task(s)?\n{listing}\n"):
                 console.print("[dim]Cancelled[/dim]")
                 raise typer.Exit(0)
 
-        client.delete_task(task_id)
-        formatter.format_success(f"Deleted: {task.content}")
+        for _, task_id, task in items:
+            client.delete_task(task_id)
+            get_formatter().format_success(f"Deleted: {task.content}")
 
     except TodoistError as e:
         get_formatter().format_error(str(e))
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
 
 
 if __name__ == "__main__":
